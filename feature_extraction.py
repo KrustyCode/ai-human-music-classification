@@ -13,7 +13,7 @@ CLIP_DURATION   = 5 #sec
 REAL_MUSIC      = "music_caps"
 AI_MUSIC        = [
     "music_ldm",
-    "music_ldm2",
+    "audio_ldm2",
     "mustango",
     "music_gen_medium",
     "stable_audio_open"
