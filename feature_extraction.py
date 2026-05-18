@@ -182,12 +182,12 @@ def compute_chromagram(audio: np.ndarray) -> np.ndarray:
     )
     return chroma.astype(np.float32)
 
-def compute_mfcc(audio: np.ndarray) -> np.ndarray:
+def compute_mfcc(audio: np.ndarray, n=13) -> np.ndarray:
     """Compute a mfcc"""
     mfcc = lb.feature.mfcc(
         y=audio,
         sr=SAMPLE_RATE,
-        n_mfcc=13,
+        n_mfcc=n,
         n_fft=N_FFT,
         hop_length=HOP_LENGTH
     )
@@ -210,12 +210,18 @@ def preprocess_clip(filepath: str, feature: str) -> list:
         match feature:
             case "mel":
                 spec = compute_mel_spectrogram(chunk)
-                spec = standardize(spec)
+            case "mfcc":
+                spec = compute_mfcc(chunk)
+            case "mfcc_20":
+                spec = compute_mfcc(chunk, 20)
+            case "mfcc_40":
+                spec = compute_mfcc(chunk, 40)
             case _:
                 raise ValueError(    
                     f"Unknown feature extraction type: '{feature}'. "
                     f"Available options are: 'mel', 'mfcc', 'chroma'."
                 )
+        spec = standardize(spec)
         out.append(spec)
     return out
 
