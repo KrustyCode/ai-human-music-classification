@@ -9,6 +9,7 @@ _cuda_paths = [
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\lib\x64",
 ]
+
 for _p in _cuda_paths:
     if os.path.exists(_p):
         os.add_dll_directory(_p)
@@ -23,11 +24,12 @@ except ImportError:
     GPU = False
     print("Backend: CPU (NumPy)")
 
-import numpy as np_cpu          # always-CPU numpy for sklearn / matplotlib
+import numpy as np_cpu
 import math
 from pathlib import Path
 import seaborn as sns
 import matplotlib.pyplot as plt
+from collections import defaultdict
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score,
     recall_score, confusion_matrix, classification_report,
@@ -44,20 +46,32 @@ def to_numpy(a):
     if isinstance(a, np_cpu.ndarray): return a
     return xp.asnumpy(a) if GPU else np_cpu.asarray(a)
 
-# ── im2col / col2im (core of Conv2d and MaxPool2d) ────────────────────────────
-
 def im2col(x, kH, kW, stride=1, pad=0):
-    """(N,C,H,W) → (N, oH*oW, C*kH*kW)  plus oH, oW."""
     N, C, H, W = x.shape
     oH = (H + 2*pad - kH) // stride + 1
     oW = (W + 2*pad - kW) // stride + 1
-    xp_ = xp.pad(x, ((0,0),(0,0),(pad,pad),(pad,pad)), mode='constant')
-    col = xp.zeros((N, C, kH, kW, oH, oW), dtype=x.dtype)
-    for i in range(kH):
-        for j in range(kW):
-            col[:, :, i, j, :, :] = xp_[:, :, i:i+stride*oH:stride,
-                                                j:j+stride*oW:stride]
-    col = col.transpose(0, 4, 5, 1, 2, 3).reshape(N, oH*oW, C*kH*kW)
+
+    if pad > 0:
+        x = xp.pad(x, ((0,0),(0,0),(pad,pad),(pad,pad)), mode='constant')
+
+    # Build index arrays — all on GPU, no Python loops
+    i0 = xp.repeat(xp.arange(kH), kW)                          # (kH*kW,)
+    i0 = xp.tile(i0, C)                                         # (C*kH*kW,)
+    i1 = stride * xp.repeat(xp.arange(oH), oW)                 # (oH*oW,)
+
+    j0 = xp.tile(xp.arange(kW), kH)                            # (kH*kW,)
+    j0 = xp.tile(j0, C)                                         # (C*kH*kW,)
+    j1 = stride * xp.tile(xp.arange(oW), oH)                   # (oH*oW,)
+
+    c_idx = xp.repeat(xp.arange(C), kH*kW)                     # (C*kH*kW,)
+
+    # Single gather operation — one GPU kernel, not 9
+    i = (i0.reshape(-1,1) + i1.reshape(1,-1))                   # (C*kH*kW, oH*oW)
+    j = (j0.reshape(-1,1) + j1.reshape(1,-1))                   # (C*kH*kW, oH*oW)
+    c = c_idx.reshape(-1,1)                                      # (C*kH*kW, 1)
+
+    col = x[:, c, i, j]                                         # (N, C*kH*kW, oH*oW)
+    col = col.transpose(0, 2, 1)                                 # (N, oH*oW, C*kH*kW)
     return col, oH, oW
 
 def col2im(dcol, x_shape, kH, kW, stride=1, pad=0):
@@ -172,6 +186,31 @@ class ReLU(Layer):
     def backward(self, d): return d * (self.cache > 0)
 
 
+class AvgPool2d(Layer):
+    def __init__(self, k, stride=None):
+        super().__init__()
+        self.k      = k
+        self.stride = stride if stride else k
+        self.cache  = None
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        oH = (H - self.k) // self.stride + 1
+        oW = (W - self.k) // self.stride + 1
+        col, _, _ = im2col(x, self.k, self.k, self.stride, 0)
+        col = col.reshape(N, oH*oW, C, self.k*self.k)
+        out = col.mean(axis=3).transpose(0,2,1).reshape(N, C, oH, oW)
+        self.cache = (x.shape, oH, oW)
+        return out
+
+    def backward(self, dout):
+        x_shape, oH, oW = self.cache
+        N, C, H, W = x_shape
+        df   = dout.reshape(N, C, -1).transpose(0, 2, 1)   # (N, oH*oW, C)
+        dcol = xp.repeat(df[:,:,:,None], self.k*self.k, axis=3) / (self.k*self.k)
+        return col2im(dcol.reshape(N, oH*oW, C*self.k*self.k),
+                      x_shape, self.k, self.k, self.stride, 0)
+
 class MaxPool2d(Layer):
     def __init__(self, k, stride=None):
         super().__init__()
@@ -203,7 +242,7 @@ class MaxPool2d(Layer):
                       x_shape, self.k, self.k, self.stride, 0)
 
 
-class AdaptiveAvgPool2d(Layer):
+class AdaptiveMaxPool2d(Layer):
     def __init__(self, out_size):
         super().__init__()
         self.oH, self.oW = (out_size, out_size) if isinstance(out_size, int) else out_size
@@ -216,10 +255,60 @@ class AdaptiveAvgPool2d(Layer):
 
     def forward(self, x):
         N, C, H, W = x.shape
-        hb = self._bins(H, self.oH); wb = self._bins(W, self.oW)
+        hb = self._bins(H, self.oH)
+        wb = self._bins(W, self.oW)
+        out       = xp.zeros((N, C, self.oH, self.oW), dtype=x.dtype)
+        max_h_idx = xp.zeros((N, C, self.oH, self.oW), dtype=xp.int32)
+        max_w_idx = xp.zeros((N, C, self.oH, self.oW), dtype=xp.int32)
+
+        for i, (h0, h1) in enumerate(hb):
+            for j, (w0, w1) in enumerate(wb):
+                patch = x[:, :, h0:h1, w0:w1]          # (N, C, ph, pw)
+                ph, pw = h1-h0, w1-w0
+                flat  = patch.reshape(N, C, ph*pw)       # (N, C, ph*pw)
+                idx   = xp.argmax(flat, axis=2)          # (N, C)
+                ni = xp.arange(N)[:, None]
+                ci = xp.arange(C)[None, :]
+                out[:, :, i, j]       = flat[ni, ci, idx]
+                max_h_idx[:, :, i, j] = h0 + idx // pw  # absolute h position
+                max_w_idx[:, :, i, j] = w0 + idx % pw   # absolute w position
+
+        self.cache = (x.shape, max_h_idx, max_w_idx)
+        return out
+
+    def backward(self, dout):
+        x_shape, max_h_idx, max_w_idx = self.cache
+        N, C, H, W = x_shape
+        dx = xp.zeros(x_shape, dtype=dout.dtype)
+        ni = xp.arange(N)[:, None]
+        ci = xp.arange(C)[None, :]
+
+        for i in range(self.oH):
+            for j in range(self.oW):
+                h_idx = max_h_idx[:, :, i, j]   # (N, C) — where was the max?
+                w_idx = max_w_idx[:, :, i, j]   # (N, C)
+                dx[ni, ci, h_idx, w_idx] += dout[:, :, i, j]
+
+        return dx
+    
+class AdaptiveAvgPool2d(Layer):
+    def __init__(self, out_size):
+        super().__init__()
+        self.oH, self.oW = (out_size, out_size) if isinstance(out_size, int) else out_size
+        self.cache = None
+
+    @staticmethod
+    def _bins(in_sz, out_sz):
+        return [(int(math.floor(i*in_sz/out_sz)),
+                 int(math.ceil((i+1)*in_sz/out_sz))) for i in range(out_sz)]
+    
+    def forward(self, x):
+        N, C, H, W = x.shape
+        hb = self._bins(H, self.oH)
+        wb = self._bins(W, self.oW)
         out = xp.zeros((N, C, self.oH, self.oW), dtype=x.dtype)
-        for i,(h0,h1) in enumerate(hb):
-            for j,(w0,w1) in enumerate(wb):
+        for i, (h0, h1) in enumerate(hb):
+            for j, (w0, w1) in enumerate(wb):
                 out[:,:,i,j] = x[:,:,h0:h1,w0:w1].mean(axis=(2,3))
         self.cache = (x.shape, hb, wb)
         return out
@@ -268,6 +357,7 @@ class Linear(Layer):
         self.grads['b'] = d.sum(0)
         return d @ self.params['W']
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Sequential container
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,20 +388,17 @@ class CNNModel:
         self.features = Sequential(
             # ── Block 1 ──────────────────────────────────
             Conv2d(1, 32, 3, padding=1), BatchNorm2d(32), ReLU(),
-            MaxPool2d(2, 2), Dropout(0.10),
+            MaxPool2d(2,2),
             # ── Block 2 ──────────────────────────────────
             Conv2d(32, 64, 3, padding=1), BatchNorm2d(64), ReLU(),
-            MaxPool2d(2, 2), Dropout(0.20),
+            MaxPool2d(2, 2),
             # ── Block 3 ──────────────────────────────────
             Conv2d(64, 128, 3, padding=1), BatchNorm2d(128), ReLU(),
-            MaxPool2d(2, 2), Dropout(0.25),
-            # ── Block 4 ──────────────────────────────────
-            Conv2d(128, 256, 3, padding=1), BatchNorm2d(256), ReLU(),
-            AdaptiveAvgPool2d((4, 4)), Dropout(0.30),
+            AdaptiveAvgPool2d((4, 4)),
         )
         self.classifier = Sequential(
             Flatten(),
-            Linear(256*4*4, 512), ReLU(), Dropout(0.40),
+            Linear(128*4*4, 512), ReLU(), Dropout(0.40),
             Linear(512, 256),     ReLU(), Dropout(0.30),
             Linear(256, num_classes),
         )
@@ -438,9 +525,7 @@ class ReduceLROnPlateau:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DataLoader:
-    """Minimal DataLoader backed by xp arrays.
-    Optionally carries a source string array (s) for per-source evaluation.
-    """
+    """Stores data on CPU; moves each batch to GPU (xp) on demand."""
     def __init__(self, x, y, batch_size=32, shuffle=True, s=None):
         self.x, self.y, self.s = x, y, s
         self.bs, self.shuffle = batch_size, shuffle
@@ -449,9 +534,11 @@ class DataLoader:
     def __iter__(self):
         idx = np_cpu.random.permutation(self.n) if self.shuffle else np_cpu.arange(self.n)
         for start in range(0, self.n, self.bs):
-            bi = idx[start:start+self.bs]
+            bi       = idx[start:start+self.bs]
+            x_batch  = to_xp(self.x[bi])                          # CPU → GPU here
+            y_batch  = (xp.asarray if GPU else np_cpu.asarray)(self.y[bi])
             src_batch = self.s[bi].tolist() if self.s is not None else None
-            yield self.x[bi], self.y[bi], src_batch
+            yield x_batch, y_batch, src_batch
 
     def __len__(self):
         return math.ceil(self.n / self.bs)
@@ -465,11 +552,12 @@ def data_preparation(train_x, train_y, val_x, val_y, test_x, test_y,
                      train_s=None, val_s=None, test_s=None):
     print(f"Using device: {'GPU (CuPy)' if GPU else 'CPU (NumPy)'}")
 
+    # ── Keep full dataset on CPU — batches are moved to GPU inside run_epoch ──
     def prep_x(a):
-        return to_xp(a.transpose(0, 3, 1, 2).astype(np_cpu.float32))
+        return a.transpose(0, 3, 1, 2).astype(np_cpu.float32)   # (N,C,H,W) CPU
 
     def prep_y(a):
-        return (xp.asarray if GPU else np_cpu.asarray)(a.astype(np_cpu.int32))
+        return a.astype(np_cpu.int32)                            # CPU
 
     xs = [prep_x(a) for a in (train_x, val_x, test_x)]
     ys = [prep_y(a) for a in (train_y, val_y, test_y)]
@@ -483,13 +571,20 @@ def data_preparation(train_x, train_y, val_x, val_y, test_x, test_y,
         DataLoader(xs[1], ys[1], batch_size, shuffle=False, s=ss[1]),
         DataLoader(xs[2], ys[2], batch_size, shuffle=False, s=ss[2]),
     )
-    num_classes = int(xp.unique(ys[0]).shape[0])
+    num_classes = len(np_cpu.unique(ys[0]))
     print(f"Number of classes: {num_classes}")
     return loaders, num_classes
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Training helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _clear_caches(model):
+    """Explicitly free all cached intermediate tensors from forward pass."""
+    for layer in model.features.layers + model.classifier.layers:
+        if hasattr(layer, 'cache'):
+            layer.cache = None
+
 
 def run_epoch(model, loader, criterion, optimizer=None):
     """One train or eval epoch. Pass optimizer=None for eval."""
@@ -498,7 +593,7 @@ def run_epoch(model, loader, criterion, optimizer=None):
 
     total_loss, preds_all, targets_all = 0.0, [], []
 
-    for inputs, targets, _ in loader:       # _ = source strings, unused here
+    for inputs, targets, _ in loader:
         if is_train: optimizer.zero_grad()
 
         logits = model.forward(inputs)
@@ -512,6 +607,12 @@ def run_epoch(model, loader, criterion, optimizer=None):
         total_loss += loss
         preds_all.extend(to_numpy(xp.argmax(logits, axis=1)).tolist())
         targets_all.extend(to_numpy(targets).tolist())
+
+        # ── Free ALL intermediate tensors after each batch ──────────────
+        _clear_caches(model)
+        del inputs, targets, logits
+        if is_train: del dout
+        if GPU: xp.get_default_memory_pool().free_all_blocks()
 
     return total_loss / len(loader), accuracy_score(targets_all, preds_all)
 
@@ -531,8 +632,13 @@ def check_early_stopping(val_loss, best_val_loss, counter, patience,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
-          epochs, patience, save_path="best_model"):
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+          epochs, patience, save_path="best_model") -> dict:
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": []
+    }
     best_val_loss, counter = float("inf"), 0
 
     for epoch in range(epochs):
@@ -560,21 +666,26 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
 # 4. Evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(model, test_loader, criterion, save_path="best_model", scenario="model"):
+def evaluate(model, test_loader, criterion, save_path="best_model", scenario="model")-> list[list]:
     model.load(save_path)
     test_loss, test_acc = run_epoch(model, test_loader, criterion)
 
     preds_all, targets_all, sources_all, probs_all = [], [], [], []
     model.eval_mode()
     for inputs, targets, sources in test_loader:
-        logits  = model.forward(inputs)
-        # softmax probabilities for ROC-AUC
-        shifted = logits - logits.max(1, keepdims=True)
-        probs   = xp.exp(shifted) / xp.exp(shifted).sum(1, keepdims=True)
-        preds_all.extend(to_numpy(xp.argmax(logits, axis=1)).tolist())
+        logits    = model.forward(inputs)
+        logits_np = to_numpy(logits)
+        shifted   = logits_np - logits_np.max(1, keepdims=True)
+        exp       = np_cpu.exp(shifted)
+        probs_np  = exp / exp.sum(1, keepdims=True)
+        preds_all.extend(np_cpu.argmax(logits_np, axis=1).tolist())
         targets_all.extend(to_numpy(targets).tolist())
         sources_all.extend(sources if sources is not None else [])
-        probs_all.extend(to_numpy(probs[:, 1]).tolist())   # prob of class AI
+        probs_all.extend(probs_np[:, 1].tolist())
+
+        del inputs, targets, logits
+        _clear_caches(model)
+        if GPU: xp.get_default_memory_pool().free_all_blocks()
 
     precision = precision_score(targets_all, preds_all, average="weighted", zero_division=0)
     recall    = recall_score(targets_all,    preds_all, average="weighted", zero_division=0)
@@ -591,7 +702,7 @@ def evaluate(model, test_loader, criterion, save_path="best_model", scenario="mo
     print("="*40)
     print("\nClassification Report:")
     print(classification_report(targets_all, preds_all,
-                                target_names=["Human", "AI"], zero_division=0))
+                                target_names=["Human", "AI"], zero_division=0, digits=4))
 
     if sources_all:
         _print_source_breakdown(targets_all, preds_all, sources_all)
@@ -601,10 +712,56 @@ def evaluate(model, test_loader, criterion, save_path="best_model", scenario="mo
     return preds_all, targets_all, sources_all
 
 
+def _print_source_breakdown(targets, preds, sources) -> None:
+    """Per-source error breakdown: how many AI/Human clips were mis-classified."""
+    groups = defaultdict(lambda: {"total": 0, "wrong": 0,
+                                               "wrong_as_human": 0, "wrong_as_ai": 0})
+    for t, p, s in zip(targets, preds, sources):
+        g = groups[s]
+        g["total"] += 1
+        if t != p:
+            g["wrong"] += 1
+            if p == 0: g["wrong_as_human"] += 1
+            else:      g["wrong_as_ai"]    += 1
+
+    print("\n" + "="*60)
+    print("Per-Source Error Breakdown")
+    print("="*60)
+    print(f"{'Source':<25} {'Total':>6} {'Wrong':>6} {'Acc':>7} {'→Human':>8} {'→AI':>6}")
+    print("-"*60)
+    for src, g in sorted(groups.items()):
+        acc = (g["total"] - g["wrong"]) / g["total"] if g["total"] else 0
+        print(f"{src:<25} {g['total']:>6} {g['wrong']:>6} "
+              f"{acc:>7.2%} {g['wrong_as_human']:>8} {g['wrong_as_ai']:>6}")
+    print("="*60)
+
 def _print_source_breakdown(targets, preds, sources):
     """Per-source error breakdown: how many AI/Human clips were mis-classified."""
-    import collections
-    groups = collections.defaultdict(lambda: {"total": 0, "wrong": 0,
+    groups = defaultdict(lambda: {"total": 0, "wrong": 0,
+                                               "wrong_as_human": 0, "wrong_as_ai": 0})
+    for t, p, s in zip(targets, preds, sources):
+        g = groups[s]
+        g["total"] += 1
+        if t != p:
+            g["wrong"] += 1
+            if p == 0: g["wrong_as_human"] += 1
+            else:      g["wrong_as_ai"]    += 1
+
+    print("\n" + "="*60)
+    print("Per-Source Error Breakdown")
+    print("="*60)
+    print(f"{'Source':<25} {'Total':>6} {'Wrong':>6} {'Acc':>7} {'→Human':>8} {'→AI':>6}")
+    print("-"*60)
+    for src, g in sorted(groups.items()):
+        acc = (g["total"] - g["wrong"]) / g["total"] if g["total"] else 0
+        print(f"{src:<25} {g['total']:>6} {g['wrong']:>6} "
+              f"{acc:>7.2%} {g['wrong_as_human']:>8} {g['wrong_as_ai']:>6}")
+    print("="*60)
+
+
+def _print_source_breakdown(targets, preds, sources):
+    """Per-source error breakdown: how many AI/Human clips were mis-classified."""
+    groups = defaultdict(lambda: {"total": 0, "wrong": 0,
                                                "wrong_as_human": 0, "wrong_as_ai": 0})
     for t, p, s in zip(targets, preds, sources):
         g = groups[s]
@@ -659,7 +816,8 @@ def plot_confusion_matrix(targets, preds, labels, save_path="confusion_matrix.pn
     plt.ylabel("True Label", fontsize=11)
     plt.tight_layout()
     folder = Path("images"); folder.mkdir(parents=True, exist_ok=True)
-    plt.savefig(folder/save_path, dpi=150); plt.show()
+    plt.savefig(folder/save_path, dpi=150)
+    plt.show()
 
 
 def plot_roc_curve(targets, probs, save_path="roc_curve.png"):
@@ -674,8 +832,10 @@ def plot_roc_curve(targets, probs, save_path="roc_curve.png"):
     plt.title("ROC Curve — Human vs AI Music", fontsize=14, fontweight="bold")
     plt.legend(loc="lower right"); plt.grid(True)
     plt.tight_layout()
-    folder = Path("images"); folder.mkdir(parents=True, exist_ok=True)
-    plt.savefig(folder/save_path, dpi=150); plt.show()
+    folder = Path("images")
+    folder.mkdir(parents=True, exist_ok=True)
+    plt.savefig(folder/save_path, dpi=150)
+    plt.show()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Orchestrator
