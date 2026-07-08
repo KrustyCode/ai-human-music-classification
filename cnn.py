@@ -46,6 +46,12 @@ def to_numpy(a):
     if isinstance(a, np_cpu.ndarray): return a
     return xp.asnumpy(a) if GPU else np_cpu.asarray(a)
 
+def softmax(logits, axis=1):
+    """Numerically-stable softmax on the active backend (xp)."""
+    shifted = logits - logits.max(axis=axis, keepdims=True)
+    exp = xp.exp(shifted)
+    return exp / exp.sum(axis=axis, keepdims=True)
+
 def im2col(x, kH, kW, stride=1, pad=0):
     N, C, H, W = x.shape
     oH = (H + 2*pad - kH) // stride + 1
@@ -459,8 +465,7 @@ class CrossEntropyLoss:
 
     def __call__(self, logits, targets):
         N, C = logits.shape
-        shifted = logits - logits.max(1, keepdims=True)
-        probs   = xp.exp(shifted) / xp.exp(shifted).sum(1, keepdims=True)
+        probs   = softmax(logits, axis=1)
         smooth  = xp.full((N, C), self.ls / C, dtype=xp.float32)
         smooth[xp.arange(N), targets] += 1.0 - self.ls
         loss = -(smooth * xp.log(probs + 1e-8)).sum(1).mean()
@@ -675,9 +680,7 @@ def evaluate(model, test_loader, criterion, save_path="best_model", scenario="mo
     for inputs, targets, sources in test_loader:
         logits    = model.forward(inputs)
         logits_np = to_numpy(logits)
-        shifted   = logits_np - logits_np.max(1, keepdims=True)
-        exp       = np_cpu.exp(shifted)
-        probs_np  = exp / exp.sum(1, keepdims=True)
+        probs_np  = to_numpy(softmax(logits, axis=1))
         preds_all.extend(np_cpu.argmax(logits_np, axis=1).tolist())
         targets_all.extend(to_numpy(targets).tolist())
         sources_all.extend(sources if sources is not None else [])
